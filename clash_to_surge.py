@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""? Clash ????? Surge ????????
+"""Convert a Clash subscription into a Surge configuration file.
 
-?????
+Example:
 
-    python clash_to_surge.py "https://example.com/subscription?target=clash" -o output.conf
+    python clash_to_surge.py "https://example.com/subscription?target=clash" -o surge.conf
 
-?????????????????????? YAML?Base64?gzip??
-???????????????????????
+The script automatically detects plain YAML, Base64, and gzip-encoded
+subscriptions and produces a Surge-compatible configuration. Warnings are
+reported for items that cannot be mapped precisely.
 
-????? PyYAML ?????? ``pip install pyyaml`` ???
+PyYAML is required: install it with ``pip install pyyaml``.
 """
 
 from __future__ import annotations
@@ -27,9 +28,9 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 try:
     import yaml  # type: ignore
-except ModuleNotFoundError as exc:  # pragma: no cover - ??????
+except ModuleNotFoundError as exc:  # pragma: no cover - explicit dependency hint
     print(
-        "??? PyYAML ?????? `pip install pyyaml` ???????",
+        "PyYAML is required. Please install it first: `pip install pyyaml`.",
         file=sys.stderr,
     )
     raise
@@ -42,7 +43,7 @@ class ConvertResult:
 
 
 def fetch_subscription(source: str, timeout: int = 20) -> bytes:
-    """? URL ??????? Clash ?????"""
+    """Load a Clash subscription from either a URL or a local file."""
 
     parsed = urllib.parse.urlparse(source)
     if parsed.scheme in {"http", "https"}:
@@ -61,16 +62,16 @@ def fetch_subscription(source: str, timeout: int = 20) -> bytes:
                 data = resp.read()
                 encoding = resp.headers.get("Content-Encoding", "").lower()
         except urllib.error.URLError as err:
-            raise RuntimeError(f"???????{err}") from err
+            raise RuntimeError(f"Failed to fetch subscription: {err}") from err
 
         if encoding == "gzip":
             return gzip.decompress(data)
         if encoding == "br":
             try:
                 import brotli  # type: ignore
-            except ModuleNotFoundError as err:  # pragma: no cover - ????
+            except ModuleNotFoundError as err:  # pragma: no cover - optional dependency
                 raise RuntimeError(
-                    "????? Brotli ??????? brotli ??pip install brotli"
+                    "The subscription is Brotli-compressed. Install brotli first: `pip install brotli`."
                 ) from err
             return brotli.decompress(data)
         if data.startswith(b"\x1f\x8b"):
@@ -81,11 +82,11 @@ def fetch_subscription(source: str, timeout: int = 20) -> bytes:
         with open(source, "rb") as fp:
             return fp.read()
 
-    raise RuntimeError("?????????????? URL ?????")
+    raise RuntimeError("Invalid source: please pass a valid URL or an existing file path.")
 
 
 def decode_subscription_payload(raw: bytes) -> str:
-    """???????????? YAML ???"""
+    """Try to turn raw subscription bytes into a YAML string."""
 
     for encoding in ("utf-8", "utf-8-sig", "gb18030"):
         try:
@@ -95,7 +96,7 @@ def decode_subscription_payload(raw: bytes) -> str:
         if "proxies:" in text or "proxy-groups:" in text or "proxy_providers" in text:
             return text
 
-    # ??????? base64
+    # some providers return Base64-encoded data
     compact = raw.strip()
     try:
         decoded = base64.b64decode(compact, validate=True)
@@ -103,11 +104,11 @@ def decode_subscription_payload(raw: bytes) -> str:
         decoded = None
 
     if not decoded:
-        # ????????????????? base64 ??
+        # loosen validation: allow whitespace or missing padding
         try:
             decoded = base64.b64decode(compact + b"==")
         except Exception as err:
-            raise RuntimeError("??????????????? Clash ??") from err
+            raise RuntimeError("Unable to recognise subscription format. Make sure it is a Clash subscription.") from err
 
     if decoded.startswith(b"\x1f\x8b"):
         decoded = gzip.decompress(decoded)
@@ -115,7 +116,7 @@ def decode_subscription_payload(raw: bytes) -> str:
     try:
         return decoded.decode("utf-8")
     except UnicodeDecodeError as err:
-        raise RuntimeError("????????? UTF-8 ??") from err
+        raise RuntimeError("Subscription content is not valid UTF-8 text.") from err
 
 
 def load_clash_config(source: str, timeout: int = 20) -> dict:
@@ -124,9 +125,9 @@ def load_clash_config(source: str, timeout: int = 20) -> dict:
     try:
         data = yaml.safe_load(text)
     except yaml.YAMLError as err:
-        raise RuntimeError(f"?? YAML ???{err}") from err
+        raise RuntimeError(f"Failed to parse YAML: {err}") from err
     if not isinstance(data, dict):
-        raise RuntimeError("????????? Clash ????")
+        raise RuntimeError("Subscription content is not a valid Clash configuration.")
     return data
 
 
@@ -136,17 +137,17 @@ def convert_proxies(proxies: Iterable[dict]) -> Tuple[List[str], List[str]]:
     for proxy in proxies or []:
         name = proxy.get("name")
         if not name:
-            warnings.append("???? name ?????????")
+            warnings.append("A proxy without a name was skipped.")
             continue
         proxy_type = (proxy.get("type") or "").lower()
         converter = PROXY_CONVERTERS.get(proxy_type)
         if not converter:
-            warnings.append(f"?? {name} ????????? {proxy_type}????")
+            warnings.append(f"Proxy {name} uses unsupported type {proxy_type}; skipped.")
             continue
         try:
             surge_body, extra_warnings = converter(proxy)
-        except Exception as err:  # pragma: no cover - ??
-            warnings.append(f"?? {name} ?????{err}")
+        except Exception as err:  # pragma: no cover - safety net
+            warnings.append(f"Proxy {name} failed to convert: {err}")
             continue
         if surge_body:
             lines.append(f"{name} = {surge_body}")
@@ -166,18 +167,18 @@ def convert_proxy_groups(groups: Iterable[dict]) -> Tuple[List[str], List[str]]:
     for group in groups or []:
         name = group.get("name")
         if not name:
-            warnings.append("???? name ??????????")
+            warnings.append("A proxy group without a name was skipped.")
             continue
         group_type = (group.get("type") or "").lower()
         surge_type = type_map.get(group_type)
         if not surge_type:
-            warnings.append(f"??? {name} ??? {group_type} ??????? select ??")
+            warnings.append(f"Proxy group {name} uses unsupported type {group_type}; treated as select.")
             surge_type = "select"
         entries = group.get("proxies") or []
         uses = group.get("use") or []
         if uses:
             warnings.append(
-                f"??? {name} ??? proxy-providers?{', '.join(uses)}???????"
+                f"Proxy group {name} references proxy-providers ({', '.join(uses)}); please add them manually."
             )
         params: List[str] = [surge_type]
         params.extend(entries)
@@ -211,7 +212,7 @@ def convert_rules(
         elif isinstance(rule, (list, tuple)):
             parts = [str(part).strip() for part in rule]
         else:
-            warnings.append(f"??????????{rule}")
+            warnings.append(f"Unrecognised rule format: {rule}")
             continue
         if not parts:
             continue
@@ -219,27 +220,27 @@ def convert_rules(
         keyword = parts[0].upper()
         if keyword == "MATCH":
             if len(parts) < 2:
-                warnings.append("MATCH ??????????")
+                warnings.append("MATCH rule without a policy was ignored.")
                 continue
             result.append(f"FINAL,{parts[1]}")
             continue
         if keyword == "RULE-SET":
             if len(parts) < 3:
-                warnings.append(f"RULE-SET ???????{rule}")
+                warnings.append(f"RULE-SET rule is missing arguments: {rule}")
                 continue
             provider_name = parts[1]
             policy = parts[2]
             provider = providers.get(provider_name)
             if not provider:
                 warnings.append(
-                    f"??? rule-provider {provider_name} ?????????????"
+                    f"rule-provider {provider_name} not found in subscription; original rule was kept."
                 )
                 result.append(",".join(parts))
                 continue
             url = provider.get("url")
             if not url:
                 warnings.append(
-                    f"rule-provider {provider_name} ?? url ??????????"
+                    f"rule-provider {provider_name} does not include url; original rule was kept."
                 )
                 result.append(",".join(parts))
                 continue
@@ -273,7 +274,7 @@ def generate_general_section(custom_items: Optional[List[str]] = None) -> str:
     if custom_items:
         for item in custom_items:
             if "=" not in item:
-                raise ValueError(f"[General] ???????? key=value?{item}")
+                raise ValueError(f"[General] custom item must be in key=value format: {item}")
             key, value = item.split("=", 1)
             items.append((key.strip(), value.strip()))
 
@@ -312,13 +313,13 @@ def convert_clash_to_surge(config: dict, general_overrides: Optional[List[str]] 
     if proxy_lines:
         sections.extend(proxy_lines)
     else:
-        sections.append("; ????????????????")
+        sections.append("; No usable proxies were found in the subscription.")
 
     sections.extend(["", "[Proxy Group]"])
     if group_lines:
         sections.extend(group_lines)
     else:
-        sections.append("; ???????????????")
+        sections.append("; No usable proxy groups were found in the subscription.")
 
     sections.extend(["", "[Rule]"])
     if rule_lines:
@@ -331,17 +332,17 @@ def convert_clash_to_surge(config: dict, general_overrides: Optional[List[str]] 
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Clash ??? Surge ????")
-    parser.add_argument("source", help="Clash ????? YAML ????")
-    parser.add_argument("-o", "--output", help="??????????????????")
+    parser = argparse.ArgumentParser(description="Convert a Clash subscription into a Surge profile.")
+    parser.add_argument("source", help="Clash subscription URL or YAML file path")
+    parser.add_argument("-o", "--output", help="Path to write the generated Surge profile")
     parser.add_argument(
-        "--timeout", type=int, default=20, help="??????????????? 20"
+        "--timeout", type=int, default=20, help="Timeout in seconds for downloading the subscription (default: 20)"
     )
     parser.add_argument(
         "--general",
         action="append",
         dest="general_items",
-        help="???? [General] ??????? key=value??????",
+        help="Extra [General] entries in key=value form; can be repeated",
     )
     return parser.parse_args(argv)
 
@@ -354,7 +355,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             clash_config, general_overrides=args.general_items
         )
     except Exception as err:
-        print(f"?????{err}", file=sys.stderr)
+        print(f"Conversion failed: {err}", file=sys.stderr)
         return 1
 
     if args.output:
@@ -362,22 +363,22 @@ def main(argv: Optional[List[str]] = None) -> int:
             with open(args.output, "w", encoding="utf-8") as fp:
                 fp.write(result.surge_config)
         except OSError as err:
-            print(f"???????{err}", file=sys.stderr)
+            print(f"Failed to write output file: {err}", file=sys.stderr)
             return 1
     else:
         sys.stdout.write(result.surge_config)
 
     if result.warnings:
-        print("\n?????????????", file=sys.stderr)
+        print("\nConversion finished with warnings:", file=sys.stderr)
         for item in result.warnings:
             print(f" - {item}", file=sys.stderr)
     else:
-        print("?????", file=sys.stderr)
+        print("Conversion finished successfully.", file=sys.stderr)
 
     return 0
 
 
-# --- ???????? ---
+# --- Proxy conversion helpers ---
 
 
 def _quote_header(headers: Dict[str, str]) -> str:
@@ -416,7 +417,7 @@ def _convert_shadowrocket_plugin(proxy: dict, params: List[str], warnings: List[
             params.append(f"mode={mode}")
         return
 
-    warnings.append(f"????? Shadowsocks ?? {plugin}????????")
+    warnings.append(f"Shadowsocks plugin {plugin} is not supported; related options were ignored.")
 
 
 def convert_ss(proxy: dict) -> Tuple[str, List[str]]:
@@ -426,7 +427,7 @@ def convert_ss(proxy: dict) -> Tuple[str, List[str]]:
     cipher = proxy.get("cipher")
     password = proxy.get("password")
     if not all([server, port, cipher, password]):
-        raise ValueError("SS ???? server/port/cipher/password ??")
+        raise ValueError("Shadowsocks proxy is missing server/port/cipher/password.")
     params: List[str] = ["ss", str(server), str(port), f"encrypt-method={cipher}", f"password={password}"]
     if proxy.get("udp"):
         params.append("udp-relay=true")
@@ -472,7 +473,7 @@ def convert_vmess(proxy: dict) -> Tuple[str, List[str]]:
         if method:
             params.append(f"method={method}")
     elif network not in {"tcp"}:
-        warnings.append(f"VMess ?? {proxy.get('name')} ??????? network={network}")
+        warnings.append(f"VMess proxy {proxy.get('name')} uses unsupported network={network}.")
     return ", ".join(params), warnings
 
 
@@ -482,7 +483,7 @@ def convert_trojan(proxy: dict) -> Tuple[str, List[str]]:
     port = proxy.get("port")
     password = proxy.get("password")
     if not all([server, port, password]):
-        raise ValueError("Trojan ???? server/port/password ??")
+        raise ValueError("Trojan proxy is missing server/port/password.")
     params: List[str] = ["trojan", str(server), str(port), f"password={password}"]
     sni = proxy.get("sni") or proxy.get("servername")
     if sni:
@@ -499,7 +500,7 @@ def convert_http(proxy: dict) -> Tuple[str, List[str]]:
     server = proxy.get("server")
     port = proxy.get("port")
     if not all([server, port]):
-        raise ValueError("HTTP ???? server/port ??")
+        raise ValueError("HTTP proxy is missing server/port.")
     params: List[str] = ["http", str(server), str(port)]
     if proxy.get("username"):
         params.append(f"username={proxy['username']}")
@@ -514,7 +515,7 @@ def convert_socks5(proxy: dict) -> Tuple[str, List[str]]:
     server = proxy.get("server")
     port = proxy.get("port")
     if not all([server, port]):
-        raise ValueError("Socks5 ???? server/port ??")
+        raise ValueError("Socks5 proxy is missing server/port.")
     params: List[str] = ["socks5", str(server), str(port)]
     if proxy.get("username"):
         params.append(f"username={proxy['username']}")
@@ -534,5 +535,5 @@ PROXY_CONVERTERS = {
 }
 
 
-if __name__ == "__main__":  # pragma: no cover - ????
+if __name__ == "__main__":  # pragma: no cover - script entry
     sys.exit(main())
