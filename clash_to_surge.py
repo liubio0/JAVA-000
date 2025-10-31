@@ -266,7 +266,6 @@ def generate_general_section(custom_items: Optional[List[str]] = None) -> str:
         "loglevel": "notify",
         "ipv6": "true",
         "skip-proxy": "127.0.0.1, 0.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, ::1",
-        "bypass-system": "true",
         "udp-policy-not-supported-behaviour": "reject",
     }
 
